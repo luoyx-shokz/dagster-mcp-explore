@@ -1,0 +1,7 @@
+[mcp_servers.dagster-mcp]
+command = "dagster-mcp"
+args = []
+
+[mcp_servers.dagster-mcp.env]
+DAGSTER_URL = "http://dev-useast1-dagster-alb-1360930776.us-east-1.elb.amazonaws.com/"
+DAGSTER_READ_ONLY = "false"
