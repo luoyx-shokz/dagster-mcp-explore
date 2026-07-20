@@ -1568,12 +1568,20 @@ def launch_job_with_partitions(
     query = """
     mutation LaunchPartitionBackfill($backfillParams: LaunchBackfillParams!) {
       launchPartitionBackfill(backfillParams: $backfillParams) {
-        ... on LaunchBackfillSuccess { backfillId }
+        __typename
+        ... on LaunchBackfillSuccess { backfillId launchedRunIds }
         ... on PartitionSetNotFoundError { message }
+        ... on PartitionKeysNotFoundError { message partitionKeys }
         ... on PipelineNotFoundError { message }
         ... on PythonError { message }
         ... on UnauthorizedError { message }
-        ... on RunConfigValidationInvalid { errors { message } }
+        ... on InvalidSubsetError { message }
+        ... on RunConflict { message }
+        ... on ConflictingExecutionParamsError { message }
+        ... on RunConfigValidationInvalid {
+          pipelineName
+          errors { message }
+        }
       }
     }
     """
@@ -1592,7 +1600,19 @@ def launch_job_with_partitions(
         }
     }
     data = gql(query, variables, env=env)
-    return data.get("launchPartitionBackfill", {})
+    result = data.get("launchPartitionBackfill", {})
+    if result.get("__typename") == "LaunchBackfillSuccess":
+        return result
+
+    typename = result.get("__typename", "UnknownResult")
+    if result.get("message"):
+        raise RuntimeError(f"Dagster backfill launch failed ({typename}): {result['message']}")
+    if result.get("errors"):
+        messages = [error.get("message", str(error)) for error in result["errors"]]
+        raise RuntimeError(
+            f"Dagster backfill launch failed ({typename}): " + "; ".join(messages)
+        )
+    raise RuntimeError(f"Dagster backfill launch failed ({typename}): {result}")
 
 
 # ── Write tools (only registered when DAGSTER_READ_ONLY=false) ────────────────
