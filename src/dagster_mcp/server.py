@@ -1400,7 +1400,7 @@ def list_backfills(limit: int = 10, env: str | None = None) -> list[dict]:
       partitionBackfillsOrError(cursor: $cursor, limit: $limit) {
         ... on PartitionBackfills {
           results {
-            backfillId
+            backfillId: id
             status
             numPartitions
             timestamp
