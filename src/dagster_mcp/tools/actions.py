@@ -1,14 +1,14 @@
 """Dagster MCP actions tools."""
 
+from collections.abc import Mapping
+
 from dagster_mcp.graphql import gql
 
 # ── Actions ───────────────────────────────────────────────────────────────────
 
 
 def _execution_tags(tags: dict[str, str] | None) -> list[dict[str, str]]:
-    if not tags:
-        return []
-    return [{"key": key, "value": value} for key, value in tags.items()]
+    return [{"key": key, "value": value} for key, value in _normalize_tags(tags).items()]
 
 
 def _execution_metadata(tags: dict[str, str] | None) -> dict | None:
@@ -16,6 +16,46 @@ def _execution_metadata(tags: dict[str, str] | None) -> dict | None:
     if not dagster_tags:
         return None
     return {"tags": dagster_tags}
+
+
+def _normalize_tags(tags: object) -> dict[str, str]:
+    if not tags:
+        return {}
+    if not isinstance(tags, Mapping):
+        raise ValueError("tags must be a dict of string keys and string values.")
+
+    normalized: dict[str, str] = {}
+    for key, value in tags.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError("tags must be a dict of string keys and string values.")
+        normalized[key] = value
+    return normalized
+
+
+def _run_config_without_execution_tags(
+    run_config: dict | None,
+    tags: dict[str, str] | None,
+) -> tuple[dict | None, dict[str, str]]:
+    normalized_tags = _normalize_tags(tags)
+    if run_config is None:
+        return None, normalized_tags
+    if not isinstance(run_config, dict):
+        raise ValueError("run_config must be a dict.")
+    if "tags" not in run_config:
+        return run_config, normalized_tags
+
+    run_config_tags = _normalize_tags(run_config["tags"])
+    conflicts = {
+        key
+        for key, value in run_config_tags.items()
+        if key in normalized_tags and normalized_tags[key] != value
+    }
+    if conflicts:
+        conflicting_keys = ", ".join(sorted(conflicts))
+        raise ValueError(f"tags conflict between run_config and tags: {conflicting_keys}")
+
+    clean_run_config = {key: value for key, value in run_config.items() if key != "tags"}
+    return clean_run_config, {**run_config_tags, **normalized_tags}
 
 
 def _raise_backfill_launch_error(result: dict) -> None:
@@ -28,6 +68,55 @@ def _raise_backfill_launch_error(result: dict) -> None:
             f"Dagster backfill launch failed ({typename}): " + "; ".join(messages)
         )
     raise RuntimeError(f"Dagster backfill launch failed ({typename}): {result}")
+
+
+def _resolve_partition_set_name(
+    job_name: str,
+    repository_location: str,
+    repository_name: str,
+    env: str | None,
+) -> str:
+    query = """
+    query PartitionSetsForJob(
+      $repositorySelector: RepositorySelector!,
+      $jobName: String!
+    ) {
+      partitionSetsOrError(
+        repositorySelector: $repositorySelector,
+        pipelineName: $jobName
+      ) {
+        __typename
+        ... on PartitionSets { results { name } }
+        ... on PipelineNotFoundError { message }
+        ... on PythonError { message }
+      }
+    }
+    """
+    variables = {
+        "repositorySelector": {
+            "repositoryLocationName": repository_location,
+            "repositoryName": repository_name,
+        },
+        "jobName": job_name,
+    }
+    data = gql(query, variables, env=env)
+    result = data.get("partitionSetsOrError", {})
+    typename = result.get("__typename", "UnknownResult")
+    if typename != "PartitionSets":
+        message = result.get("message", result)
+        raise RuntimeError(
+            f"Dagster partition set lookup failed ({typename}): {message}"
+        )
+
+    names = [item.get("name") for item in result.get("results", []) if item.get("name")]
+    if len(names) == 1:
+        return names[0]
+    if not names:
+        raise RuntimeError(f"Dagster job {job_name!r} has no partition set.")
+    raise RuntimeError(
+        f"Dagster job {job_name!r} has multiple partition sets: {names}. "
+        "Pass partition_set_name explicitly."
+    )
 
 
 def terminate_run(run_id: str, env: str | None = None) -> dict:
@@ -116,13 +205,15 @@ def launch_job(
       }
     }
     """
+    clean_run_config, merged_tags = _run_config_without_execution_tags(run_config, tags)
+
     variables = {
         "locationName": repository_location,
         "repoName": repository_name,
         "jobName": job_name,
         "solidSelection": asset_keys or None,
-        "runConfigData": run_config or {},
-        "executionMetadata": _execution_metadata(tags),
+        "runConfigData": clean_run_config or {},
+        "executionMetadata": _execution_metadata(merged_tags),
     }
     data = gql(query, variables, env=env)
     return data.get("launchRun", {})
@@ -135,6 +226,7 @@ def launch_job_with_partitions(
     repository_name: str = "__repository__",
     partition_set_name: str | None = None,
     tags: dict[str, str] | None = None,
+    run_config: dict | None = None,
     from_failure: bool = False,
     env: str | None = None,
 ) -> dict:
@@ -152,10 +244,12 @@ def launch_job_with_partitions(
     Optional parameters:
     - repository_name: defaults to '__repository__', override if you have
       multiple repositories in a single code location
-    - partition_set_name: partition set name; defaults to '{job_name}_partition_set'.
-      Override this if the job uses a non-standard partition set name.
+    - partition_set_name: partition set name. When omitted, the exact name is
+      resolved from Dagster metadata for the selected job and repository.
     - tags: additional key-value tags to attach to the launched runs.
       Example: {'triggered_by': 'dataops_agent'}
+    - run_config: dict of run configuration to pass to each partition run.
+      Example: {'ops': {'clean': {'config': {'dry_run': False, 'approved': True}}}}
     - from_failure: if True, only re-run the failed steps within the given
       partitions (useful for retrying partially-failed partitioned runs)
 
@@ -165,7 +259,16 @@ def launch_job_with_partitions(
     When to use: to run a job for a specific date/partition, backfill historical
     partitions, or retry failed partitions. For non-partitioned jobs, use launch_job.
     """
-    resolved_partition_set = partition_set_name or f"{job_name}_partition_set"
+    if not partition_keys:
+        raise ValueError("partition_keys must contain at least one partition key.")
+
+    clean_run_config, merged_tags = _run_config_without_execution_tags(run_config, tags)
+    resolved_partition_set = partition_set_name or _resolve_partition_set_name(
+        job_name,
+        repository_location,
+        repository_name,
+        env,
+    )
 
     query = """
     mutation LaunchPartitionBackfill($backfillParams: LaunchBackfillParams!) {
@@ -197,13 +300,19 @@ def launch_job_with_partitions(
                 "partitionSetName": resolved_partition_set,
             },
             "partitionNames": partition_keys,
-            "tags": _execution_tags(tags),
+            "tags": _execution_tags(merged_tags),
             "fromFailure": from_failure,
         }
     }
+    if clean_run_config is not None:
+        variables["backfillParams"]["runConfigData"] = clean_run_config
+
     data = gql(query, variables, env=env)
     result = data.get("launchPartitionBackfill", {})
-    if result.get("__typename") == "LaunchBackfillSuccess":
+    if (
+        result.get("__typename") == "LaunchBackfillSuccess"
+        and result.get("backfillId")
+    ):
         return result
 
     _raise_backfill_launch_error(result)
